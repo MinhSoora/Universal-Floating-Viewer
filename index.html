@@ -94,6 +94,29 @@
             <input type="number" id="winHeight" min="200" max="1200" step="10" value="650" />
           </div>
         </div>
+
+        <div class="field">
+          <label for="winBg">Window background</label>
+          <div class="color-field">
+            <input type="color" id="winBg" value="#0d1210" />
+            <input type="text" id="winBgText" class="color-field__hex" value="#0d1210" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="winRadius">Border radius: <output id="winRadiusOut" for="winRadius">12</output>px</label>
+          <input type="range" id="winRadius" min="0" max="32" value="12" />
+        </div>
+
+        <div class="field">
+          <label for="winPadding">Window padding: <output id="winPaddingOut" for="winPadding">0</output>px</label>
+          <input type="range" id="winPadding" min="0" max="24" value="0" />
+        </div>
+
+        <div class="field field--checkbox">
+          <input type="checkbox" id="showHeaderInPip" />
+          <label for="showHeaderInPip">Show a mini header inside the floating window</label>
+        </div>
       </div>
 
       <div class="panel" id="panel-appearance" role="tabpanel" aria-labelledby="tab-appearance" hidden>
@@ -149,7 +172,7 @@
         </div>
         <div class="field field--checkbox">
           <input type="checkbox" id="autoUpdatePipToggle" checked />
-          <label for="autoUpdatePipToggle">Navigate the floating window automatically when the URL changes</label>
+          <label for="autoUpdatePipToggle">Update the floating window automatically when the URL changes</label>
         </div>
 
         <button type="button" id="resetSettingsBtn" class="btn btn--danger btn--block">Reset all settings</button>
