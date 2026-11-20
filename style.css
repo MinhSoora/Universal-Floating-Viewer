@@ -255,68 +255,64 @@ body {
 .btn--small { padding: 6px 10px; font-size: 0.78rem; }
 .btn--block { width: 100%; margin-top: 8px; }
 
-/* ---------- Site card (replaces the old iframe preview) ---------- */
+/* ---------- Site card (replaces iframe preview) ---------- */
+
+[hidden] { display: none !important; }
 
 .site-card {
-  display: flex;
-  gap: 16px;
-  align-items: flex-start;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--bg-sunken);
-  padding: 22px;
-  min-height: 120px;
+  min-height: 360px;
+  display: flex;
 }
 
-.site-card__icon {
-  flex-shrink: 0;
-  width: 44px; height: 44px;
-  display: grid;
-  place-items: center;
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-  color: var(--accent);
+.site-card__empty,
+.site-card__info {
+  margin: auto;
+  text-align: center;
+  padding: 32px;
+  max-width: 520px;
+  color: var(--text-muted);
 }
 
-.site-card__info { min-width: 0; }
+.site-card__empty svg { color: var(--text-faint); margin-bottom: 10px; }
+
+.site-card__label {
+  margin: 0 0 6px;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+}
 
 .site-card__host {
+  margin: 0 0 6px;
   font-family: var(--font-display);
-  font-size: 1rem;
-  font-weight: 600;
-  margin: 0 0 4px;
+  font-size: 1.6rem;
   color: var(--text);
-  word-break: break-word;
 }
 
 .site-card__url {
+  margin: 0 0 20px;
   font-family: var(--font-mono);
-  font-size: 0.8rem;
-  color: var(--text-muted);
-  margin: 0 0 8px;
+  font-size: 0.82rem;
   word-break: break-all;
 }
 
-.site-card__meta {
-  font-size: 0.82rem;
-  color: var(--text-faint);
-  margin: 0;
+.site-card__actions {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  flex-wrap: wrap;
 }
 
-.site-card[data-state="loaded"] .site-card__meta { color: var(--accent); }
+.site-card__actions a { text-decoration: none; }
 
-.workspace__note {
-  margin: 12px 2px 0;
-  font-size: 0.8rem;
-  color: var(--text-faint);
-  line-height: 1.5;
-}
-
-.field__note {
-  margin: 0;
+.site-card__note {
+  margin: 20px 0 0;
   font-size: 0.78rem;
   color: var(--text-faint);
-  line-height: 1.5;
 }
 
 /* ---------- Sidebar / tabs ---------- */
@@ -548,7 +544,7 @@ body {
   .sidebar   { grid-column: 1; grid-row: 2; position: static; }
   .history   { grid-column: 1; grid-row: 3; }
   .app-header { padding: 14px 16px; }
-  .preview-frame { min-height: 360px; }
+  .site-card { min-height: 280px; }
 }
 
 @media (max-width: 560px) {
