@@ -465,13 +465,18 @@
 
     openFallbackPopup(url) {
       const w = state.window.width, h = state.window.height;
-      // "noopener" is important here: without it, window.opener is set on the
-      // popup, and many sites run anti-clickjacking/anti-popup JS that checks
-      // window.opener and self-closes if it's present. That self-close is
-      // exactly what looks like "flashes open then immediately closes" — the
-      // popup isn't being blocked, the target site is closing itself on us.
-      const features = `popup=yes,width=${w},height=${h},resizable=yes,scrollbars=yes,noopener`;
+      // Note: we deliberately do NOT pass "noopener" here. Most browsers
+      // return null from window.open() when noopener is used, which breaks
+      // our ability to even hold a reference to the popup (so we can't poll
+      // popup.closed, and the code below would wrongly treat every open as
+      // "blocked"). Instead we null out window.opener on the popup itself,
+      // right after opening, which gets us the same anti-detection benefit
+      // without losing the reference.
+      const features = `popup=yes,width=${w},height=${h},resizable=yes,scrollbars=yes`;
       const popup = window.open(url, 'ufv-popup', features);
+      if (popup) {
+        try { popup.opener = null; } catch (e) { /* cross-origin set can throw in some browsers; safe to ignore */ }
+      }
       if (!popup) {
         showStatus('Popup blocked too — your browser prevented both. Try "New tab" instead.', 'error', 6000);
         return;
