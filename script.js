@@ -7,7 +7,7 @@
      - Settings     : app settings state + DOM binding
      - History      : recent URL list
      - UrlUtil       : normalize/validate URLs
-     - Card         : site card with direct href links (no iframe)
+     - Preview      : main-page iframe preview + embed-block detection
      - PiP          : Document Picture-in-Picture window management
      - UI           : header, theme, tabs, status bar, dialog
    =================================================================== */
@@ -21,6 +21,7 @@
   const DEFAULT_STATE = {
     lastUrl: '',
     history: [], // [{ url, title, ts }]
+    blockedHosts: [], // hosts the user marked as "refuses to be embedded"
     window: {
       width: 420,
       height: 650,
@@ -34,13 +35,15 @@
       accent: '#7fae2e',
       fontFamily: "'IBM Plex Sans', system-ui, sans-serif",
       fontSize: 15,
+      frameOpacity: 100,
       customCss: ''
     },
     behavior: {
       restoreUrl: true,
       restoreSettings: true,
       keepUrlOnReopen: true,
-      autoUpdatePip: true
+      autoUpdatePip: true,
+      autoPopupBlocked: true
     },
     headerHidden: false
   };
@@ -81,12 +84,15 @@
         merged.history = merged.history.filter(
           (h) => h && typeof h.url === 'string' && UrlUtil.isValid(h.url)
         );
+        if (!Array.isArray(merged.blockedHosts)) merged.blockedHosts = [];
+        merged.blockedHosts = merged.blockedHosts.filter((h) => typeof h === 'string' && h);
         // Clamp numeric fields defensively
         merged.window.width = clamp(num(merged.window.width, 420), 240, 2400);
         merged.window.height = clamp(num(merged.window.height, 650), 200, 2000);
         merged.window.radius = clamp(num(merged.window.radius, 12), 0, 60);
         merged.window.padding = clamp(num(merged.window.padding, 0), 0, 60);
         merged.appearance.fontSize = clamp(num(merged.appearance.fontSize, 15), 10, 28);
+        merged.appearance.frameOpacity = clamp(num(merged.appearance.frameOpacity, 100), 10, 100);
         return merged;
       } catch (e) {
         console.warn('Stored settings were invalid, resetting to defaults:', e);
@@ -146,12 +152,73 @@
     }
   };
 
+  /* ---------------- Embed helpers ---------------- */
+
+  // Sites that send X-Frame-Options / CSP frame-ancestors and refuse to be
+  // shown inside an iframe. These go straight to a real popup window.
+  const KNOWN_BLOCKED = [
+    'google.com', 'bing.com', 'facebook.com', 'instagram.com', 'x.com',
+    'twitter.com', 'github.com', 'linkedin.com', 'reddit.com', 'netflix.com',
+    'amazon.com', 'paypal.com', 'whatsapp.com', 'discord.com', 'tiktok.com',
+    'youtube.com', 'zalo.me', 'chat.openai.com', 'chatgpt.com', 'claude.ai'
+  ];
+
+  function hostMatches(host, domain) {
+    return host === domain || host.endsWith('.' + domain);
+  }
+
+  const Embed = {
+    /** Turn watch-page links into embeddable player links where possible. */
+    toEmbeddable(url) {
+      const u = UrlUtil.parse(url);
+      if (!u) return url;
+      const host = u.hostname.replace(/^www\./, '');
+      if (hostMatches(host, 'youtube.com')) {
+        if (u.pathname.startsWith('/embed/')) return url;
+        const id = u.searchParams.get('v');
+        if (u.pathname === '/watch' && id) return 'https://www.youtube.com/embed/' + encodeURIComponent(id);
+        const m = u.pathname.match(/^\/(?:shorts|live)\/([\w-]+)/);
+        if (m) return 'https://www.youtube.com/embed/' + m[1];
+      }
+      if (host === 'youtu.be') {
+        const id = u.pathname.slice(1).split('/')[0];
+        if (id) return 'https://www.youtube.com/embed/' + encodeURIComponent(id);
+      }
+      if (host === 'vimeo.com') {
+        const m = u.pathname.match(/^\/(\d+)/);
+        if (m) return 'https://player.vimeo.com/video/' + m[1];
+      }
+      return url;
+    },
+    isTransformed(url) {
+      return Embed.toEmbeddable(url) !== url;
+    },
+    /** True when we expect the site to refuse embedding. */
+    isBlocked(url) {
+      if (Embed.isTransformed(url)) return false;
+      const u = UrlUtil.parse(url);
+      if (!u) return false;
+      const host = u.hostname.replace(/^www\./, '');
+      return KNOWN_BLOCKED.some((d) => hostMatches(host, d)) ||
+        state.blockedHosts.some((d) => hostMatches(host, d));
+    },
+    remember(url) {
+      const u = UrlUtil.parse(url);
+      if (!u) return;
+      const host = u.hostname.replace(/^www\./, '');
+      if (!state.blockedHosts.includes(host)) {
+        state.blockedHosts.push(host);
+        persist();
+      }
+    }
+  };
+
   /* ---------------- App state ---------------- */
 
   let state = Store.load();
   let currentUrl = '';
   let pipWindow = null;
-  let pipPanel = null;
+  let pipIframe = null;
 
   function persist() {
     if (state.behavior.restoreSettings) {
@@ -179,12 +246,16 @@
     openTabBtn: $('#openTabBtn'),
     openPipBtn: $('#openPipBtn'),
 
-    siteEmpty: $('#siteEmpty'),
-    siteInfo: $('#siteInfo'),
-    siteHost: $('#siteHost'),
-    siteUrl: $('#siteUrl'),
-    siteLinkSame: $('#siteLinkSame'),
-    siteLinkNew: $('#siteLinkNew'),
+    frameWrap: $('#previewFrameWrap'),
+    frame: $('#previewFrame'),
+    frameEmpty: $('.preview-frame__empty'),
+    frameLoading: $('.preview-frame__loading'),
+    frameBlocked: $('.preview-frame__blocked'),
+    embedHint: $('#embedHint'),
+    hintPopupBtn: $('#hintPopupBtn'),
+    blockedPopupBtn: $('#blockedPopupBtn'),
+    blockedTabBtn: $('#blockedTabBtn'),
+    blockedMsg: $('#blockedMsg'),
 
     tabs: Array.from(document.querySelectorAll('.tabs__btn')),
     panels: Array.from(document.querySelectorAll('.panel')),
@@ -205,6 +276,8 @@
     fontFamily: $('#fontFamily'),
     fontSize: $('#fontSize'),
     fontSizeOut: $('#fontSizeOut'),
+    frameOpacity: $('#frameOpacity'),
+    frameOpacityOut: $('#frameOpacityOut'),
     customCss: $('#customCss'),
     applyCssBtn: $('#applyCssBtn'),
     customCssStyle: $('#customCssStyle'),
@@ -213,6 +286,7 @@
     restoreSettingsToggle: $('#restoreSettingsToggle'),
     keepUrlOnReopenToggle: $('#keepUrlOnReopenToggle'),
     autoUpdatePipToggle: $('#autoUpdatePipToggle'),
+    autoPopupBlockedToggle: $('#autoPopupBlockedToggle'),
     resetSettingsBtn: $('#resetSettingsBtn'),
 
     historyList: $('#historyList'),
@@ -272,6 +346,7 @@
     root.setProperty('--accent-strong', state.appearance.accent);
     root.setProperty('--font-body', state.appearance.fontFamily);
     root.setProperty('--base-font-size', state.appearance.fontSize + 'px');
+    el.frame.style.opacity = String(state.appearance.frameOpacity / 100);
     el.customCssStyle.textContent = state.appearance.customCss || '';
   }
 
@@ -279,21 +354,75 @@
     el.header.classList.toggle('is-hidden', !!state.headerHidden);
   }
 
-  /* ---------------- Site card (thay cho iframe) ---------------- */
+  /* ---------------- Preview (main page iframe) ---------------- */
 
-  const Card = {
-    show(url) {
-      const has = !!url;
-      el.siteEmpty.hidden = has;
-      el.siteInfo.hidden = !has;
-      if (!has) return;
-      el.siteHost.textContent = UrlUtil.hostLabel(url);
-      el.siteUrl.textContent = url;
-      el.siteLinkSame.href = url;
-      el.siteLinkNew.href = url;
-      showStatus('Ready: ' + UrlUtil.hostLabel(url), 'success', 2000);
+  const Preview = {
+    setState(mode) {
+      // mode: 'empty' | 'loading' | 'loaded' | 'blocked'
+      el.frameWrap.dataset.state = mode;
+      el.frameEmpty.hidden = mode !== 'empty';
+      el.frameLoading.hidden = mode !== 'loading';
+      el.frameBlocked.hidden = mode !== 'blocked';
+      el.frame.hidden = mode !== 'loaded';
     }
   };
+
+  // Loads a URL into the main-page preview iframe. Sites that forbid embedding
+  // (X-Frame-Options / CSP frame-ancestors) usually never fire a usable 'load'
+  // event, and we can't read cross-origin frame content to confirm either way —
+  // so a generous timeout is used as a heuristic, and we never claim success
+  // we can't verify.
+  let hardTimeout = null;
+
+  // userInitiated = true when triggered by a click/submit, so opening a popup
+  // is allowed by the browser. On startup restore we only show the blocked state.
+  function loadIntoPreview(url, userInitiated) {
+    clearTimeout(hardTimeout);
+    el.embedHint.hidden = true;
+
+    // Known (or previously remembered) blocked site: don't even try the iframe.
+    if (Embed.isBlocked(url)) {
+      el.frame.src = 'about:blank';
+      el.blockedMsg.textContent = UrlUtil.hostLabel(url) + ' doesn\u2019t allow being shown inside another page.';
+      Preview.setState('blocked');
+      if (userInitiated && state.behavior.autoPopupBlocked) {
+        PiP.openFallbackPopup(url, true);
+      } else {
+        showStatus(UrlUtil.hostLabel(url) + ' refuses embedding \u2014 use "Open as popup".', 'error', 5000);
+      }
+      return;
+    }
+
+    Preview.setState('loading');
+    let settled = false;
+
+    function finishLoaded() {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardTimeout);
+      Preview.setState('loaded');
+      // We can't read cross-origin frames, so a "refused to connect" error page
+      // also fires 'load'. Always offer a one-click way out.
+      el.embedHint.hidden = false;
+      showStatus('Loaded ' + UrlUtil.hostLabel(url), 'success');
+    }
+    function finishBlocked() {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardTimeout);
+      el.blockedMsg.textContent = 'This site may not allow embedding.';
+      Preview.setState('blocked');
+      showStatus('This site refused to be embedded.', 'error', 5000);
+    }
+
+    el.frame.onload = finishLoaded;
+    el.frame.onerror = finishBlocked;
+    hardTimeout = setTimeout(() => {
+      if (!settled) finishBlocked();
+    }, 9000);
+
+    el.frame.src = Embed.toEmbeddable(url);
+  }
 
   /* ---------------- Document Picture-in-Picture ---------------- */
 
@@ -313,6 +442,10 @@
       }
       if (!url) {
         showStatus('Enter and load a URL first.', 'error');
+        return;
+      }
+      if (Embed.isBlocked(url)) {
+        PiP.openFallbackPopup(url, true);
         return;
       }
       if (PiP.isOpen()) {
@@ -337,7 +470,7 @@
 
       pipWindow.addEventListener('pagehide', () => {
         pipWindow = null;
-        pipPanel = null;
+        pipIframe = null;
         PiP.updateButtonLabel();
         showStatus('Floating window closed.', 'info', 2000);
       });
@@ -375,31 +508,24 @@
         header.className = 'pip-header';
         header.innerHTML =
           '<span class="pip-header__url"></span>' +
+          '<button type="button" class="pip-header__popup" title="Page not showing? Open as popup" aria-label="Open as popup window">\u2197</button>' +
           '<button type="button" class="pip-header__close" aria-label="Close floating window">✕</button>';
         header.querySelector('.pip-header__url').textContent = UrlUtil.hostLabel(url);
+        header.querySelector('.pip-header__popup').addEventListener('click', () => {
+          const target = currentUrl || url;
+          Embed.remember(target);
+          PiP.openFallbackPopup(target, true);
+        });
         header.querySelector('.pip-header__close').addEventListener('click', () => PiP.close());
         doc.body.appendChild(header);
       }
 
-      // Không dùng iframe: bảng điều khiển với link href thật tới trang đích.
-      const panel = doc.createElement('div');
-      panel.className = 'pip-panel';
-      panel.innerHTML =
-        '<p class="pip-panel__label">Target site</p>' +
-        '<h2 class="pip-panel__host"></h2>' +
-        '<p class="pip-panel__url"></p>' +
-        '<div class="pip-panel__actions">' +
-          '<a class="pip-btn pip-btn--primary" data-role="link" target="_blank" rel="noopener noreferrer">Open page</a>' +
-          '<button type="button" class="pip-btn" data-role="popup">Open as popup</button>' +
-        '</div>';
-      doc.body.appendChild(panel);
-      pipPanel = panel;
-      PiP.fillPanel(panel, url);
-      panel.querySelector('[data-role="popup"]').addEventListener('click', () => {
-        const u = currentUrl || state.lastUrl;
-        const w = state.window.width, h = state.window.height;
-        if (u) win.open(u, 'ufv-popup', `popup=yes,width=${w},height=${h},resizable=yes,scrollbars=yes`);
-      });
+      const frame = doc.createElement('iframe');
+      frame.className = 'pip-frame';
+      frame.referrerPolicy = 'no-referrer';
+      frame.src = Embed.toEmbeddable(url);
+      doc.body.appendChild(frame);
+      pipIframe = frame;
     },
 
     syncStyles() {
@@ -415,15 +541,13 @@
       style.textContent = buildPipInlineCss();
     },
 
-    fillPanel(panel, url) {
-      panel.querySelector('.pip-panel__host').textContent = UrlUtil.hostLabel(url);
-      panel.querySelector('.pip-panel__url').textContent = url;
-      panel.querySelector('[data-role="link"]').href = url;
-    },
-
     navigate(url) {
-      if (!PiP.isOpen() || !pipPanel) return;
-      PiP.fillPanel(pipPanel, url);
+      if (!PiP.isOpen() || !pipIframe) return;
+      if (Embed.isBlocked(url)) {
+        PiP.openFallbackPopup(url, true);
+        return;
+      }
+      pipIframe.src = Embed.toEmbeddable(url);
       const label = pipWindow.document.querySelector('.pip-header__url');
       if (label) label.textContent = UrlUtil.hostLabel(url);
     },
@@ -433,7 +557,7 @@
         pipWindow.close();
       }
       pipWindow = null;
-      pipPanel = null;
+      pipIframe = null;
       PiP.updateButtonLabel();
     },
 
@@ -442,14 +566,15 @@
       if (span) span.textContent = PiP.isOpen() ? 'Close floating window' : 'Open floating window';
     },
 
-    openFallbackPopup(url) {
+    openFallbackPopup(url, quiet) {
       const w = state.window.width, h = state.window.height;
       const features = `popup=yes,width=${w},height=${h},resizable=yes,scrollbars=yes`;
       const popup = window.open(url, 'ufv-popup', features);
       if (!popup) {
-        showStatus('Popup blocked too — your browser prevented both. Try "New tab" instead.', 'error', 6000);
+        showStatus('Popup blocked \u2014 allow popups for this page, or use "New tab".', 'error', 6000);
       } else {
-        showStatus('Opened as a regular popup window instead of PiP.', 'info', 4000);
+        popup.focus();
+        showStatus(quiet ? 'Opened ' + UrlUtil.hostLabel(url) + ' in a popup window (it blocks embedding).' : 'Opened as a regular popup window instead of PiP.', 'info', 4000);
       }
     },
 
@@ -475,24 +600,12 @@
         border-radius: ${w.radius}px ${w.radius}px 0 0;
       }
       .pip-header__url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .pip-header__close { background: none; border: 0; color: inherit; cursor: pointer; font-size: 14px; padding: 2px 6px; }
-      .pip-panel {
-        flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
-        gap: 6px; padding: 20px; text-align: center; box-sizing: border-box;
-        font-family: var(--font-body, sans-serif); color: var(--text, #e7ede9);
-        background: var(--bg-sunken, #0a0e0c);
+      .pip-header__popup, .pip-header__close { background: none; border: 0; color: inherit; cursor: pointer; font-size: 14px; padding: 2px 6px; }
+      .pip-frame {
+        flex: 1; width: 100%; border: 0;
         border-radius: ${state.window.showHeaderInPip ? `0 0 ${w.radius}px ${w.radius}px` : `${w.radius}px`};
+        background: #fff;
       }
-      .pip-panel__label { margin: 0; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-faint, #6c7a71); }
-      .pip-panel__host { margin: 0; font-size: 22px; }
-      .pip-panel__url { margin: 0 0 12px; font: 12px var(--font-mono, monospace); color: var(--text-muted, #9aa89f); word-break: break-all; }
-      .pip-panel__actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
-      .pip-btn {
-        padding: 9px 14px; border-radius: 8px; border: 1px solid var(--border, #223028);
-        background: var(--bg-raised, #131a17); color: inherit; font: 500 13px var(--font-body, sans-serif);
-        cursor: pointer; text-decoration: none;
-      }
-      .pip-btn--primary { background: var(--accent, #7fae2e); color: var(--accent-contrast, #0a0e0c); border-color: transparent; }
     `;
   }
 
@@ -571,10 +684,10 @@
     state.lastUrl = normalized;
     persist();
 
-    Card.show(normalized);
+    loadIntoPreview(normalized, true);
     History.add(normalized);
 
-    if (PiP.isOpen() && state.behavior.autoUpdatePip) {
+    if (PiP.isOpen() && state.behavior.autoUpdatePip && !Embed.isBlocked(normalized)) {
       PiP.navigate(normalized);
     }
   }
@@ -598,12 +711,15 @@
     el.fontFamily.value = state.appearance.fontFamily;
     el.fontSize.value = state.appearance.fontSize;
     el.fontSizeOut.textContent = state.appearance.fontSize;
+    el.frameOpacity.value = state.appearance.frameOpacity;
+    el.frameOpacityOut.textContent = state.appearance.frameOpacity;
     el.customCss.value = state.appearance.customCss;
 
     el.restoreUrlToggle.checked = state.behavior.restoreUrl;
     el.restoreSettingsToggle.checked = state.behavior.restoreSettings;
     el.keepUrlOnReopenToggle.checked = state.behavior.keepUrlOnReopen;
     el.autoUpdatePipToggle.checked = state.behavior.autoUpdatePip;
+    el.autoPopupBlockedToggle.checked = state.behavior.autoPopupBlocked;
   }
 
   function bindSettingsEvents() {
@@ -681,6 +797,12 @@
       applyAppearanceVars();
       persist();
     });
+    el.frameOpacity.addEventListener('input', () => {
+      el.frameOpacityOut.textContent = el.frameOpacity.value;
+      state.appearance.frameOpacity = num(el.frameOpacity.value, 100);
+      applyAppearanceVars();
+      persist();
+    });
     el.applyCssBtn.addEventListener('click', () => {
       state.appearance.customCss = el.customCss.value;
       applyAppearanceVars();
@@ -703,6 +825,11 @@
     });
     el.autoUpdatePipToggle.addEventListener('change', () => {
       state.behavior.autoUpdatePip = el.autoUpdatePipToggle.checked;
+      persist();
+    });
+
+    el.autoPopupBlockedToggle.addEventListener('change', () => {
+      state.behavior.autoPopupBlocked = el.autoPopupBlockedToggle.checked;
       persist();
     });
 
@@ -761,6 +888,22 @@
     });
 
     el.urlInput.addEventListener('input', () => el.urlInput.classList.remove('is-invalid'));
+
+    function popupCurrent(remember) {
+      const target = currentUrl || UrlUtil.normalize(el.urlInput.value);
+      if (!target || !UrlUtil.isValid(target)) {
+        showStatus('Load a valid URL first.', 'error');
+        return;
+      }
+      if (remember) {
+        Embed.remember(target);
+        showStatus('Will open ' + UrlUtil.hostLabel(target) + ' in a popup next time.', 'success', 3000);
+      }
+      PiP.openFallbackPopup(target, true);
+    }
+    el.hintPopupBtn.addEventListener('click', () => popupCurrent(true));
+    el.blockedPopupBtn.addEventListener('click', () => popupCurrent(true));
+    el.blockedTabBtn.addEventListener('click', () => el.openTabBtn.click());
 
     el.openTabBtn.addEventListener('click', () => {
       const target = currentUrl || UrlUtil.normalize(el.urlInput.value);
@@ -824,9 +967,9 @@
     if (state.behavior.restoreUrl && state.lastUrl && UrlUtil.isValid(state.lastUrl)) {
       el.urlInput.value = state.lastUrl;
       currentUrl = state.lastUrl;
-      Card.show(state.lastUrl);
+      loadIntoPreview(state.lastUrl);
     } else {
-      Card.show('');
+      Preview.setState('empty');
     }
   }
 
