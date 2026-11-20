@@ -7,8 +7,8 @@
      - Settings     : app settings state + DOM binding
      - History      : recent URL list
      - UrlUtil       : normalize/validate URLs
-     - Preview      : main-page iframe preview + embed-block detection
-     - PiP          : Document Picture-in-Picture window management
+     - Card         : site card with direct href links (no iframe)
+     - FloatWin     : Floating popup window (navigates straight to the page)
      - UI           : header, theme, tabs, status bar, dialog
    =================================================================== */
 
@@ -24,17 +24,12 @@
     window: {
       width: 420,
       height: 650,
-      bg: '#0d1210',
-      radius: 12,
-      padding: 0,
-      showHeaderInPip: false
     },
     appearance: {
       darkMode: true,
       accent: '#7fae2e',
       fontFamily: "'IBM Plex Sans', system-ui, sans-serif",
       fontSize: 15,
-      frameOpacity: 100,
       customCss: ''
     },
     behavior: {
@@ -85,10 +80,7 @@
         // Clamp numeric fields defensively
         merged.window.width = clamp(num(merged.window.width, 420), 240, 2400);
         merged.window.height = clamp(num(merged.window.height, 650), 200, 2000);
-        merged.window.radius = clamp(num(merged.window.radius, 12), 0, 60);
-        merged.window.padding = clamp(num(merged.window.padding, 0), 0, 60);
         merged.appearance.fontSize = clamp(num(merged.appearance.fontSize, 15), 10, 28);
-        merged.appearance.frameOpacity = clamp(num(merged.appearance.frameOpacity, 100), 10, 100);
         return merged;
       } catch (e) {
         console.warn('Stored settings were invalid, resetting to defaults:', e);
@@ -152,8 +144,8 @@
 
   let state = Store.load();
   let currentUrl = '';
-  let pipWindow = null;
-  let pipIframe = null;
+  let floatWin = null;
+  let watchTimer = null;
 
   function persist() {
     if (state.behavior.restoreSettings) {
@@ -181,24 +173,18 @@
     openTabBtn: $('#openTabBtn'),
     openPipBtn: $('#openPipBtn'),
 
-    frameWrap: $('#previewFrameWrap'),
-    frame: $('#previewFrame'),
-    frameEmpty: $('.preview-frame__empty'),
-    frameLoading: $('.preview-frame__loading'),
-    frameBlocked: $('.preview-frame__blocked'),
+    siteEmpty: $('#siteEmpty'),
+    siteInfo: $('#siteInfo'),
+    siteHost: $('#siteHost'),
+    siteUrl: $('#siteUrl'),
+    siteLinkSame: $('#siteLinkSame'),
+    siteLinkNew: $('#siteLinkNew'),
 
     tabs: Array.from(document.querySelectorAll('.tabs__btn')),
     panels: Array.from(document.querySelectorAll('.panel')),
 
     winWidth: $('#winWidth'),
     winHeight: $('#winHeight'),
-    winBg: $('#winBg'),
-    winBgText: $('#winBgText'),
-    winRadius: $('#winRadius'),
-    winRadiusOut: $('#winRadiusOut'),
-    winPadding: $('#winPadding'),
-    winPaddingOut: $('#winPaddingOut'),
-    showHeaderInPip: $('#showHeaderInPip'),
 
     darkModeToggle: $('#darkModeToggle'),
     accentColor: $('#accentColor'),
@@ -206,8 +192,6 @@
     fontFamily: $('#fontFamily'),
     fontSize: $('#fontSize'),
     fontSizeOut: $('#fontSizeOut'),
-    frameOpacity: $('#frameOpacity'),
-    frameOpacityOut: $('#frameOpacityOut'),
     customCss: $('#customCss'),
     applyCssBtn: $('#applyCssBtn'),
     customCssStyle: $('#customCssStyle'),
@@ -275,7 +259,6 @@
     root.setProperty('--accent-strong', state.appearance.accent);
     root.setProperty('--font-body', state.appearance.fontFamily);
     root.setProperty('--base-font-size', state.appearance.fontSize + 'px');
-    el.frame.style.opacity = String(state.appearance.frameOpacity / 100);
     el.customCssStyle.textContent = state.appearance.customCss || '';
   }
 
@@ -283,254 +266,87 @@
     el.header.classList.toggle('is-hidden', !!state.headerHidden);
   }
 
-  /* ---------------- Preview (main page iframe) ---------------- */
+  /* ---------------- Site card (thay cho iframe) ---------------- */
 
-  const Preview = {
-    setState(mode) {
-      // mode: 'empty' | 'loading' | 'loaded' | 'blocked'
-      el.frameWrap.dataset.state = mode;
-      el.frameEmpty.hidden = mode !== 'empty';
-      el.frameLoading.hidden = mode !== 'loading';
-      el.frameBlocked.hidden = mode !== 'blocked';
-      el.frame.hidden = mode !== 'loaded';
+  const Card = {
+    show(url) {
+      const has = !!url;
+      el.siteEmpty.hidden = has;
+      el.siteInfo.hidden = !has;
+      if (!has) return;
+      el.siteHost.textContent = UrlUtil.hostLabel(url);
+      el.siteUrl.textContent = url;
+      el.siteLinkSame.href = url;
+      el.siteLinkNew.href = url;
+      showStatus('Ready: ' + UrlUtil.hostLabel(url), 'success', 2000);
     }
   };
 
-  // Loads a URL into the main-page preview iframe. Sites that forbid embedding
-  // (X-Frame-Options / CSP frame-ancestors) usually never fire a usable 'load'
-  // event, and we can't read cross-origin frame content to confirm either way —
-  // so a generous timeout is used as a heuristic, and we never claim success
-  // we can't verify.
-  let hardTimeout = null;
+  /* ---------------- Floating window (popup thật, điều hướng trực tiếp) ---------------- */
 
-  function loadIntoPreview(url) {
-    clearTimeout(hardTimeout);
-    Preview.setState('loading');
-    let settled = false;
+  const FloatWin = {
+    NAME: 'ufv-popup',
 
-    function finishLoaded() {
-      if (settled) return;
-      settled = true;
-      clearTimeout(hardTimeout);
-      Preview.setState('loaded');
-      showStatus('Loaded ' + UrlUtil.hostLabel(url), 'success');
-    }
-    function finishBlocked() {
-      if (settled) return;
-      settled = true;
-      clearTimeout(hardTimeout);
-      Preview.setState('blocked');
-      showStatus('This site refused to be embedded.', 'error', 5000);
-    }
+    isOpen() { return !!floatWin && !floatWin.closed; },
 
-    el.frame.onload = finishLoaded;
-    el.frame.onerror = finishBlocked;
-    hardTimeout = setTimeout(() => {
-      // No confirmation either way after a generous wait — most real pages
-      // (even slow ones) paint something within this window; sites that block
-      // embedding typically never fire 'load' with usable content.
-      if (!settled) finishBlocked();
-    }, 9000);
-
-    el.frame.src = url;
-  }
-
-  /* ---------------- Document Picture-in-Picture ---------------- */
-
-  const PiP = {
-    isSupported() {
-      return 'documentPictureInPicture' in window;
+    features() {
+      const w = state.window.width, h = state.window.height;
+      const left = Math.max(0, (screen.availLeft || 0) + screen.availWidth - w - 24);
+      const top = (screen.availTop || 0) + 60;
+      return `popup=yes,width=${w},height=${h},left=${left},top=${top},resizable=yes,scrollbars=yes`;
     },
 
-    isOpen() {
-      return !!pipWindow && !pipWindow.closed;
-    },
-
-    async open(url) {
-      if (!PiP.isSupported()) {
-        showStatus('Your browser does not support floating windows (Document Picture-in-Picture). Try a recent Chrome/Edge, or use "New tab" instead.', 'error', 7000);
+    open(url) {
+      if (!url) { showStatus('Enter and load a URL first.', 'error'); return; }
+      if (FloatWin.isOpen()) {
+        FloatWin.navigate(url);
+        floatWin.focus();
         return;
       }
-      if (!url) {
-        showStatus('Enter and load a URL first.', 'error');
+      // Mở about:blank cùng origin -> ngắt opener -> rồi điều hướng thẳng tới trang.
+      const win = window.open('', FloatWin.NAME, FloatWin.features());
+      if (!win) {
+        showStatus('Popup blocked — allow popups for this page, or use "New tab".', 'error', 6000);
         return;
       }
-      if (PiP.isOpen()) {
-        PiP.navigate(url);
-        PiP.syncStyles();
-        return;
-      }
-
-      try {
-        pipWindow = await window.documentPictureInPicture.requestWindow({
-          width: state.window.width,
-          height: state.window.height
-        });
-      } catch (err) {
-        console.warn('PiP request failed:', err);
-        showStatus('Could not open the floating window (it may need a user gesture, or was blocked). Opening a regular popup instead.', 'error', 6000);
-        PiP.openFallbackPopup(url);
-        return;
-      }
-
-      PiP.buildContents(pipWindow, url);
-
-      pipWindow.addEventListener('pagehide', () => {
-        pipWindow = null;
-        pipIframe = null;
-        PiP.updateButtonLabel();
-        showStatus('Floating window closed.', 'info', 2000);
-      });
-
-      PiP.updateButtonLabel();
+      try { win.opener = null; } catch (e) { /* ignore */ }
+      win.location.href = url;
+      floatWin = win;
+      FloatWin.watch();
+      FloatWin.updateButtonLabel();
       showStatus('Floating window opened.', 'success', 2000);
     },
 
-    buildContents(win, url) {
-      const doc = win.document;
-      doc.title = 'Floating Viewer';
-
-      // Copy this page's stylesheets so the PiP window matches current theming.
-      Array.from(document.styleSheets).forEach((sheet) => {
-        try {
-          if (sheet.href) {
-            const link = doc.createElement('link');
-            link.rel = 'stylesheet';
-            link.href = sheet.href;
-            doc.head.appendChild(link);
-          }
-        } catch (e) { /* cross-origin stylesheet access can throw; safe to skip */ }
-      });
-      const inlineStyle = doc.createElement('style');
-      inlineStyle.textContent = buildPipInlineCss();
-      doc.head.appendChild(inlineStyle);
-
-      doc.documentElement.setAttribute('data-theme', state.appearance.darkMode ? 'dark' : 'light');
-
-      doc.body.innerHTML = '';
-      doc.body.className = 'pip-body';
-
-      if (state.window.showHeaderInPip) {
-        const header = doc.createElement('div');
-        header.className = 'pip-header';
-        header.innerHTML =
-          '<span class="pip-header__url"></span>' +
-          '<button type="button" class="pip-header__close" aria-label="Close floating window">✕</button>';
-        header.querySelector('.pip-header__url').textContent = UrlUtil.hostLabel(url);
-        header.querySelector('.pip-header__close').addEventListener('click', () => PiP.close());
-        doc.body.appendChild(header);
-      }
-
-      const frame = doc.createElement('iframe');
-      frame.className = 'pip-frame';
-      frame.referrerPolicy = 'no-referrer';
-      frame.src = url;
-      doc.body.appendChild(frame);
-      pipIframe = frame;
-    },
-
-    syncStyles() {
-      if (!PiP.isOpen()) return;
-      const doc = pipWindow.document;
-      doc.documentElement.setAttribute('data-theme', state.appearance.darkMode ? 'dark' : 'light');
-      const style = doc.querySelector('style[data-pip-inline]') || (() => {
-        const s = doc.createElement('style');
-        s.setAttribute('data-pip-inline', '1');
-        doc.head.appendChild(s);
-        return s;
-      })();
-      style.textContent = buildPipInlineCss();
-    },
-
     navigate(url) {
-      if (!PiP.isOpen() || !pipIframe) return;
-      pipIframe.src = url;
-      const label = pipWindow.document.querySelector('.pip-header__url');
-      if (label) label.textContent = UrlUtil.hostLabel(url);
+      if (!FloatWin.isOpen()) return;
+      try { floatWin.location.href = url; } catch (e) { window.open(url, FloatWin.NAME); }
     },
 
     close() {
-      if (PiP.isOpen()) {
-        pipWindow.close();
-      }
-      pipWindow = null;
-      pipIframe = null;
-      PiP.updateButtonLabel();
+      if (FloatWin.isOpen()) floatWin.close();
+      floatWin = null;
+      clearInterval(watchTimer);
+      FloatWin.updateButtonLabel();
+    },
+
+    // Không có sự kiện "closed" cho cửa sổ khác origin, nên kiểm tra định kỳ.
+    watch() {
+      clearInterval(watchTimer);
+      watchTimer = setInterval(() => {
+        if (!FloatWin.isOpen()) {
+          clearInterval(watchTimer);
+          floatWin = null;
+          FloatWin.updateButtonLabel();
+          showStatus('Floating window closed.', 'info', 2000);
+        }
+      }, 800);
     },
 
     updateButtonLabel() {
       const span = el.openPipBtn.querySelector('span');
-      if (span) span.textContent = PiP.isOpen() ? 'Close floating window' : 'Open floating window';
-    },
-
-    openFallbackPopup(url) {
-      const w = state.window.width, h = state.window.height;
-      // Note: we deliberately do NOT pass "noopener" here. Most browsers
-      // return null from window.open() when noopener is used, which breaks
-      // our ability to even hold a reference to the popup (so we can't poll
-      // popup.closed, and the code below would wrongly treat every open as
-      // "blocked"). Instead we null out window.opener on the popup itself,
-      // right after opening, which gets us the same anti-detection benefit
-      // without losing the reference.
-      const features = `popup=yes,width=${w},height=${h},resizable=yes,scrollbars=yes`;
-      const popup = window.open(url, 'ufv-popup', features);
-      if (popup) {
-        try { popup.opener = null; } catch (e) { /* cross-origin set can throw in some browsers; safe to ignore */ }
-      }
-      if (!popup) {
-        showStatus('Popup blocked too — your browser prevented both. Try "New tab" instead.', 'error', 6000);
-        return;
-      }
-      showStatus('Opened as a regular popup window instead of PiP.', 'info', 4000);
-
-      // Detect a very-fast self-close (the site closing itself rather than
-      // the browser blocking it) so we can tell the user what actually
-      // happened instead of leaving them guessing.
-      const openedAt = Date.now();
-      const watcher = setInterval(() => {
-        if (popup.closed) {
-          clearInterval(watcher);
-          if (Date.now() - openedAt < 4000) {
-            showStatus(
-              'That site closed its own window right after loading — likely anti-embedding/anti-popup protection on its end. Try "New tab" instead; some sites cannot be shown this way.',
-              'error',
-              8000
-            );
-          }
-        }
-      }, 300);
-    },
-
-    toggle(url) {
-      if (PiP.isOpen()) {
-        PiP.close();
-      } else {
-        PiP.open(url);
-      }
+      if (span) span.textContent = FloatWin.isOpen() ? 'Close floating window' : 'Open floating window';
     }
   };
-
-  function buildPipInlineCss() {
-    const w = state.window;
-    return `
-      html, body.pip-body { margin: 0; height: 100%; background: ${w.bg}; }
-      body.pip-body { display: flex; flex-direction: column; padding: ${w.padding}px; box-sizing: border-box; }
-      .pip-header {
-        display: flex; align-items: center; justify-content: space-between;
-        padding: 6px 10px; font: 500 12px var(--font-body, sans-serif);
-        color: var(--text, #e7ede9); background: var(--bg-raised, #131a17);
-        border-bottom: 1px solid var(--border, #223028);
-        border-radius: ${w.radius}px ${w.radius}px 0 0;
-      }
-      .pip-header__url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .pip-header__close { background: none; border: 0; color: inherit; cursor: pointer; font-size: 14px; padding: 2px 6px; }
-      .pip-frame {
-        flex: 1; width: 100%; border: 0;
-        border-radius: ${state.window.showHeaderInPip ? `0 0 ${w.radius}px ${w.radius}px` : `${w.radius}px`};
-        background: #fff;
-      }
-    `;
-  }
 
   /* ---------------- History ---------------- */
 
@@ -607,11 +423,11 @@
     state.lastUrl = normalized;
     persist();
 
-    loadIntoPreview(normalized);
+    Card.show(normalized);
     History.add(normalized);
 
-    if (PiP.isOpen() && state.behavior.autoUpdatePip) {
-      PiP.navigate(normalized);
+    if (FloatWin.isOpen() && state.behavior.autoUpdatePip) {
+      FloatWin.navigate(normalized);
     }
   }
 
@@ -620,13 +436,6 @@
   function initSettingsUI() {
     el.winWidth.value = state.window.width;
     el.winHeight.value = state.window.height;
-    el.winBg.value = state.window.bg;
-    el.winBgText.value = state.window.bg;
-    el.winRadius.value = state.window.radius;
-    el.winRadiusOut.textContent = state.window.radius;
-    el.winPadding.value = state.window.padding;
-    el.winPaddingOut.textContent = state.window.padding;
-    el.showHeaderInPip.checked = state.window.showHeaderInPip;
 
     el.darkModeToggle.checked = state.appearance.darkMode;
     el.accentColor.value = state.appearance.accent;
@@ -634,8 +443,6 @@
     el.fontFamily.value = state.appearance.fontFamily;
     el.fontSize.value = state.appearance.fontSize;
     el.fontSizeOut.textContent = state.appearance.fontSize;
-    el.frameOpacity.value = state.appearance.frameOpacity;
-    el.frameOpacityOut.textContent = state.appearance.frameOpacity;
     el.customCss.value = state.appearance.customCss;
 
     el.restoreUrlToggle.checked = state.behavior.restoreUrl;
@@ -654,45 +461,12 @@
       state.window.height = clamp(num(el.winHeight.value, 650), 200, 2000);
       persist();
     });
-    el.winBg.addEventListener('input', () => {
-      el.winBgText.value = el.winBg.value;
-      state.window.bg = el.winBg.value;
-      persist();
-      PiP.syncStyles();
-    });
-    el.winBgText.addEventListener('change', () => {
-      if (/^#[0-9a-f]{6}$/i.test(el.winBgText.value)) {
-        el.winBg.value = el.winBgText.value;
-        state.window.bg = el.winBgText.value;
-        persist();
-        PiP.syncStyles();
-      }
-    });
-    el.winRadius.addEventListener('input', () => {
-      el.winRadiusOut.textContent = el.winRadius.value;
-      state.window.radius = num(el.winRadius.value, 12);
-      persist();
-      PiP.syncStyles();
-    });
-    el.winPadding.addEventListener('input', () => {
-      el.winPaddingOut.textContent = el.winPadding.value;
-      state.window.padding = num(el.winPadding.value, 0);
-      persist();
-      PiP.syncStyles();
-    });
-    el.showHeaderInPip.addEventListener('change', () => {
-      state.window.showHeaderInPip = el.showHeaderInPip.checked;
-      persist();
-      // Header add/remove needs a rebuild rather than a style sync.
-      if (PiP.isOpen()) PiP.buildContents(pipWindow, currentUrl || state.lastUrl);
-    });
 
     // Appearance
     el.darkModeToggle.addEventListener('change', () => {
       state.appearance.darkMode = el.darkModeToggle.checked;
       applyTheme();
       persist();
-      PiP.syncStyles();
     });
     el.accentColor.addEventListener('input', () => {
       el.accentColorText.value = el.accentColor.value;
@@ -716,12 +490,6 @@
     el.fontSize.addEventListener('input', () => {
       el.fontSizeOut.textContent = el.fontSize.value;
       state.appearance.fontSize = num(el.fontSize.value, 15);
-      applyAppearanceVars();
-      persist();
-    });
-    el.frameOpacity.addEventListener('input', () => {
-      el.frameOpacityOut.textContent = el.frameOpacity.value;
-      state.appearance.frameOpacity = num(el.frameOpacity.value, 100);
       applyAppearanceVars();
       persist();
     });
@@ -792,7 +560,6 @@
       el.darkModeToggle.checked = state.appearance.darkMode;
       applyTheme();
       persist();
-      PiP.syncStyles();
     });
   }
 
@@ -817,15 +584,15 @@
 
     el.openPipBtn.addEventListener('click', () => {
       const target = currentUrl || UrlUtil.normalize(el.urlInput.value);
-      if (PiP.isOpen()) {
-        PiP.close();
+      if (FloatWin.isOpen()) {
+        FloatWin.close();
         return;
       }
       if (!target || !UrlUtil.isValid(target)) {
         showStatus('Load a URL first, then open the floating window.', 'error');
         return;
       }
-      PiP.open(target);
+      FloatWin.open(target);
     });
   }
 
@@ -845,19 +612,13 @@
   /* ---------------- Init ---------------- */
 
   function init() {
-    if (!PiP.isSupported()) {
-      el.openPipBtn.title = 'Document Picture-in-Picture is not supported in this browser — will fall back to a popup window.';
-    }
-    if (!window.isSecureContext) {
-      showStatus('This page isn\u2019t running in a secure context (HTTPS or localhost) — the floating window may be unavailable.', 'error', 6000);
-    }
 
     initSettingsUI();
     applyTheme();
     applyAppearanceVars();
     applyHeaderVisibility();
     History.render();
-    PiP.updateButtonLabel();
+    FloatWin.updateButtonLabel();
 
     bindTabs();
     bindHeaderButtons();
@@ -868,9 +629,9 @@
     if (state.behavior.restoreUrl && state.lastUrl && UrlUtil.isValid(state.lastUrl)) {
       el.urlInput.value = state.lastUrl;
       currentUrl = state.lastUrl;
-      loadIntoPreview(state.lastUrl);
+      Card.show(state.lastUrl);
     } else {
-      Preview.setState('empty');
+      Card.show('');
     }
   }
 
