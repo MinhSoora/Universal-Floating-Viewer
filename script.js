@@ -8,7 +8,7 @@
      - History      : recent URL list
      - UrlUtil       : normalize/validate URLs
      - Card         : site card with direct href links (no iframe)
-     - FloatWin     : Floating popup window (navigates straight to the page)
+     - PiP          : Document Picture-in-Picture window management
      - UI           : header, theme, tabs, status bar, dialog
    =================================================================== */
 
@@ -24,6 +24,10 @@
     window: {
       width: 420,
       height: 650,
+      bg: '#0d1210',
+      radius: 12,
+      padding: 0,
+      showHeaderInPip: false
     },
     appearance: {
       darkMode: true,
@@ -80,6 +84,8 @@
         // Clamp numeric fields defensively
         merged.window.width = clamp(num(merged.window.width, 420), 240, 2400);
         merged.window.height = clamp(num(merged.window.height, 650), 200, 2000);
+        merged.window.radius = clamp(num(merged.window.radius, 12), 0, 60);
+        merged.window.padding = clamp(num(merged.window.padding, 0), 0, 60);
         merged.appearance.fontSize = clamp(num(merged.appearance.fontSize, 15), 10, 28);
         return merged;
       } catch (e) {
@@ -144,8 +150,8 @@
 
   let state = Store.load();
   let currentUrl = '';
-  let floatWin = null;
-  let watchTimer = null;
+  let pipWindow = null;
+  let pipPanel = null;
 
   function persist() {
     if (state.behavior.restoreSettings) {
@@ -185,6 +191,13 @@
 
     winWidth: $('#winWidth'),
     winHeight: $('#winHeight'),
+    winBg: $('#winBg'),
+    winBgText: $('#winBgText'),
+    winRadius: $('#winRadius'),
+    winRadiusOut: $('#winRadiusOut'),
+    winPadding: $('#winPadding'),
+    winPaddingOut: $('#winPaddingOut'),
+    showHeaderInPip: $('#showHeaderInPip'),
 
     darkModeToggle: $('#darkModeToggle'),
     accentColor: $('#accentColor'),
@@ -282,71 +295,206 @@
     }
   };
 
-  /* ---------------- Floating window (popup thật, điều hướng trực tiếp) ---------------- */
+  /* ---------------- Document Picture-in-Picture ---------------- */
 
-  const FloatWin = {
-    NAME: 'ufv-popup',
-
-    isOpen() { return !!floatWin && !floatWin.closed; },
-
-    features() {
-      const w = state.window.width, h = state.window.height;
-      const left = Math.max(0, (screen.availLeft || 0) + screen.availWidth - w - 24);
-      const top = (screen.availTop || 0) + 60;
-      return `popup=yes,width=${w},height=${h},left=${left},top=${top},resizable=yes,scrollbars=yes`;
+  const PiP = {
+    isSupported() {
+      return 'documentPictureInPicture' in window;
     },
 
-    open(url) {
-      if (!url) { showStatus('Enter and load a URL first.', 'error'); return; }
-      if (FloatWin.isOpen()) {
-        FloatWin.navigate(url);
-        floatWin.focus();
+    isOpen() {
+      return !!pipWindow && !pipWindow.closed;
+    },
+
+    async open(url) {
+      if (!PiP.isSupported()) {
+        showStatus('Your browser does not support floating windows (Document Picture-in-Picture). Try a recent Chrome/Edge, or use "New tab" instead.', 'error', 7000);
         return;
       }
-      // Mở about:blank cùng origin -> ngắt opener -> rồi điều hướng thẳng tới trang.
-      const win = window.open('', FloatWin.NAME, FloatWin.features());
-      if (!win) {
-        showStatus('Popup blocked — allow popups for this page, or use "New tab".', 'error', 6000);
+      if (!url) {
+        showStatus('Enter and load a URL first.', 'error');
         return;
       }
-      try { win.opener = null; } catch (e) { /* ignore */ }
-      win.location.href = url;
-      floatWin = win;
-      FloatWin.watch();
-      FloatWin.updateButtonLabel();
+      if (PiP.isOpen()) {
+        PiP.navigate(url);
+        PiP.syncStyles();
+        return;
+      }
+
+      try {
+        pipWindow = await window.documentPictureInPicture.requestWindow({
+          width: state.window.width,
+          height: state.window.height
+        });
+      } catch (err) {
+        console.warn('PiP request failed:', err);
+        showStatus('Could not open the floating window (it may need a user gesture, or was blocked). Opening a regular popup instead.', 'error', 6000);
+        PiP.openFallbackPopup(url);
+        return;
+      }
+
+      PiP.buildContents(pipWindow, url);
+
+      pipWindow.addEventListener('pagehide', () => {
+        pipWindow = null;
+        pipPanel = null;
+        PiP.updateButtonLabel();
+        showStatus('Floating window closed.', 'info', 2000);
+      });
+
+      PiP.updateButtonLabel();
       showStatus('Floating window opened.', 'success', 2000);
     },
 
+    buildContents(win, url) {
+      const doc = win.document;
+      doc.title = 'Floating Viewer';
+
+      // Copy this page's stylesheets so the PiP window matches current theming.
+      Array.from(document.styleSheets).forEach((sheet) => {
+        try {
+          if (sheet.href) {
+            const link = doc.createElement('link');
+            link.rel = 'stylesheet';
+            link.href = sheet.href;
+            doc.head.appendChild(link);
+          }
+        } catch (e) { /* cross-origin stylesheet access can throw; safe to skip */ }
+      });
+      const inlineStyle = doc.createElement('style');
+      inlineStyle.textContent = buildPipInlineCss();
+      doc.head.appendChild(inlineStyle);
+
+      doc.documentElement.setAttribute('data-theme', state.appearance.darkMode ? 'dark' : 'light');
+
+      doc.body.innerHTML = '';
+      doc.body.className = 'pip-body';
+
+      if (state.window.showHeaderInPip) {
+        const header = doc.createElement('div');
+        header.className = 'pip-header';
+        header.innerHTML =
+          '<span class="pip-header__url"></span>' +
+          '<button type="button" class="pip-header__close" aria-label="Close floating window">✕</button>';
+        header.querySelector('.pip-header__url').textContent = UrlUtil.hostLabel(url);
+        header.querySelector('.pip-header__close').addEventListener('click', () => PiP.close());
+        doc.body.appendChild(header);
+      }
+
+      // Không dùng iframe: bảng điều khiển với link href thật tới trang đích.
+      const panel = doc.createElement('div');
+      panel.className = 'pip-panel';
+      panel.innerHTML =
+        '<p class="pip-panel__label">Target site</p>' +
+        '<h2 class="pip-panel__host"></h2>' +
+        '<p class="pip-panel__url"></p>' +
+        '<div class="pip-panel__actions">' +
+          '<a class="pip-btn pip-btn--primary" data-role="link" target="_blank" rel="noopener noreferrer">Open page</a>' +
+          '<button type="button" class="pip-btn" data-role="popup">Open as popup</button>' +
+        '</div>';
+      doc.body.appendChild(panel);
+      pipPanel = panel;
+      PiP.fillPanel(panel, url);
+      panel.querySelector('[data-role="popup"]').addEventListener('click', () => {
+        const u = currentUrl || state.lastUrl;
+        const w = state.window.width, h = state.window.height;
+        if (u) win.open(u, 'ufv-popup', `popup=yes,width=${w},height=${h},resizable=yes,scrollbars=yes`);
+      });
+    },
+
+    syncStyles() {
+      if (!PiP.isOpen()) return;
+      const doc = pipWindow.document;
+      doc.documentElement.setAttribute('data-theme', state.appearance.darkMode ? 'dark' : 'light');
+      const style = doc.querySelector('style[data-pip-inline]') || (() => {
+        const s = doc.createElement('style');
+        s.setAttribute('data-pip-inline', '1');
+        doc.head.appendChild(s);
+        return s;
+      })();
+      style.textContent = buildPipInlineCss();
+    },
+
+    fillPanel(panel, url) {
+      panel.querySelector('.pip-panel__host').textContent = UrlUtil.hostLabel(url);
+      panel.querySelector('.pip-panel__url').textContent = url;
+      panel.querySelector('[data-role="link"]').href = url;
+    },
+
     navigate(url) {
-      if (!FloatWin.isOpen()) return;
-      try { floatWin.location.href = url; } catch (e) { window.open(url, FloatWin.NAME); }
+      if (!PiP.isOpen() || !pipPanel) return;
+      PiP.fillPanel(pipPanel, url);
+      const label = pipWindow.document.querySelector('.pip-header__url');
+      if (label) label.textContent = UrlUtil.hostLabel(url);
     },
 
     close() {
-      if (FloatWin.isOpen()) floatWin.close();
-      floatWin = null;
-      clearInterval(watchTimer);
-      FloatWin.updateButtonLabel();
-    },
-
-    // Không có sự kiện "closed" cho cửa sổ khác origin, nên kiểm tra định kỳ.
-    watch() {
-      clearInterval(watchTimer);
-      watchTimer = setInterval(() => {
-        if (!FloatWin.isOpen()) {
-          clearInterval(watchTimer);
-          floatWin = null;
-          FloatWin.updateButtonLabel();
-          showStatus('Floating window closed.', 'info', 2000);
-        }
-      }, 800);
+      if (PiP.isOpen()) {
+        pipWindow.close();
+      }
+      pipWindow = null;
+      pipPanel = null;
+      PiP.updateButtonLabel();
     },
 
     updateButtonLabel() {
       const span = el.openPipBtn.querySelector('span');
-      if (span) span.textContent = FloatWin.isOpen() ? 'Close floating window' : 'Open floating window';
+      if (span) span.textContent = PiP.isOpen() ? 'Close floating window' : 'Open floating window';
+    },
+
+    openFallbackPopup(url) {
+      const w = state.window.width, h = state.window.height;
+      const features = `popup=yes,width=${w},height=${h},resizable=yes,scrollbars=yes`;
+      const popup = window.open(url, 'ufv-popup', features);
+      if (!popup) {
+        showStatus('Popup blocked too — your browser prevented both. Try "New tab" instead.', 'error', 6000);
+      } else {
+        showStatus('Opened as a regular popup window instead of PiP.', 'info', 4000);
+      }
+    },
+
+    toggle(url) {
+      if (PiP.isOpen()) {
+        PiP.close();
+      } else {
+        PiP.open(url);
+      }
     }
   };
+
+  function buildPipInlineCss() {
+    const w = state.window;
+    return `
+      html, body.pip-body { margin: 0; height: 100%; background: ${w.bg}; }
+      body.pip-body { display: flex; flex-direction: column; padding: ${w.padding}px; box-sizing: border-box; }
+      .pip-header {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 6px 10px; font: 500 12px var(--font-body, sans-serif);
+        color: var(--text, #e7ede9); background: var(--bg-raised, #131a17);
+        border-bottom: 1px solid var(--border, #223028);
+        border-radius: ${w.radius}px ${w.radius}px 0 0;
+      }
+      .pip-header__url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .pip-header__close { background: none; border: 0; color: inherit; cursor: pointer; font-size: 14px; padding: 2px 6px; }
+      .pip-panel {
+        flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+        gap: 6px; padding: 20px; text-align: center; box-sizing: border-box;
+        font-family: var(--font-body, sans-serif); color: var(--text, #e7ede9);
+        background: var(--bg-sunken, #0a0e0c);
+        border-radius: ${state.window.showHeaderInPip ? `0 0 ${w.radius}px ${w.radius}px` : `${w.radius}px`};
+      }
+      .pip-panel__label { margin: 0; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-faint, #6c7a71); }
+      .pip-panel__host { margin: 0; font-size: 22px; }
+      .pip-panel__url { margin: 0 0 12px; font: 12px var(--font-mono, monospace); color: var(--text-muted, #9aa89f); word-break: break-all; }
+      .pip-panel__actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+      .pip-btn {
+        padding: 9px 14px; border-radius: 8px; border: 1px solid var(--border, #223028);
+        background: var(--bg-raised, #131a17); color: inherit; font: 500 13px var(--font-body, sans-serif);
+        cursor: pointer; text-decoration: none;
+      }
+      .pip-btn--primary { background: var(--accent, #7fae2e); color: var(--accent-contrast, #0a0e0c); border-color: transparent; }
+    `;
+  }
 
   /* ---------------- History ---------------- */
 
@@ -426,8 +574,8 @@
     Card.show(normalized);
     History.add(normalized);
 
-    if (FloatWin.isOpen() && state.behavior.autoUpdatePip) {
-      FloatWin.navigate(normalized);
+    if (PiP.isOpen() && state.behavior.autoUpdatePip) {
+      PiP.navigate(normalized);
     }
   }
 
@@ -436,6 +584,13 @@
   function initSettingsUI() {
     el.winWidth.value = state.window.width;
     el.winHeight.value = state.window.height;
+    el.winBg.value = state.window.bg;
+    el.winBgText.value = state.window.bg;
+    el.winRadius.value = state.window.radius;
+    el.winRadiusOut.textContent = state.window.radius;
+    el.winPadding.value = state.window.padding;
+    el.winPaddingOut.textContent = state.window.padding;
+    el.showHeaderInPip.checked = state.window.showHeaderInPip;
 
     el.darkModeToggle.checked = state.appearance.darkMode;
     el.accentColor.value = state.appearance.accent;
@@ -461,12 +616,45 @@
       state.window.height = clamp(num(el.winHeight.value, 650), 200, 2000);
       persist();
     });
+    el.winBg.addEventListener('input', () => {
+      el.winBgText.value = el.winBg.value;
+      state.window.bg = el.winBg.value;
+      persist();
+      PiP.syncStyles();
+    });
+    el.winBgText.addEventListener('change', () => {
+      if (/^#[0-9a-f]{6}$/i.test(el.winBgText.value)) {
+        el.winBg.value = el.winBgText.value;
+        state.window.bg = el.winBgText.value;
+        persist();
+        PiP.syncStyles();
+      }
+    });
+    el.winRadius.addEventListener('input', () => {
+      el.winRadiusOut.textContent = el.winRadius.value;
+      state.window.radius = num(el.winRadius.value, 12);
+      persist();
+      PiP.syncStyles();
+    });
+    el.winPadding.addEventListener('input', () => {
+      el.winPaddingOut.textContent = el.winPadding.value;
+      state.window.padding = num(el.winPadding.value, 0);
+      persist();
+      PiP.syncStyles();
+    });
+    el.showHeaderInPip.addEventListener('change', () => {
+      state.window.showHeaderInPip = el.showHeaderInPip.checked;
+      persist();
+      // Header add/remove needs a rebuild rather than a style sync.
+      if (PiP.isOpen()) PiP.buildContents(pipWindow, currentUrl || state.lastUrl);
+    });
 
     // Appearance
     el.darkModeToggle.addEventListener('change', () => {
       state.appearance.darkMode = el.darkModeToggle.checked;
       applyTheme();
       persist();
+      PiP.syncStyles();
     });
     el.accentColor.addEventListener('input', () => {
       el.accentColorText.value = el.accentColor.value;
@@ -560,6 +748,7 @@
       el.darkModeToggle.checked = state.appearance.darkMode;
       applyTheme();
       persist();
+      PiP.syncStyles();
     });
   }
 
@@ -584,15 +773,15 @@
 
     el.openPipBtn.addEventListener('click', () => {
       const target = currentUrl || UrlUtil.normalize(el.urlInput.value);
-      if (FloatWin.isOpen()) {
-        FloatWin.close();
+      if (PiP.isOpen()) {
+        PiP.close();
         return;
       }
       if (!target || !UrlUtil.isValid(target)) {
         showStatus('Load a URL first, then open the floating window.', 'error');
         return;
       }
-      FloatWin.open(target);
+      PiP.open(target);
     });
   }
 
@@ -612,13 +801,19 @@
   /* ---------------- Init ---------------- */
 
   function init() {
+    if (!PiP.isSupported()) {
+      el.openPipBtn.title = 'Document Picture-in-Picture is not supported in this browser — will fall back to a popup window.';
+    }
+    if (!window.isSecureContext) {
+      showStatus('This page isn\u2019t running in a secure context (HTTPS or localhost) — the floating window may be unavailable.', 'error', 6000);
+    }
 
     initSettingsUI();
     applyTheme();
     applyAppearanceVars();
     applyHeaderVisibility();
     History.render();
-    FloatWin.updateButtonLabel();
+    PiP.updateButtonLabel();
 
     bindTabs();
     bindHeaderButtons();
